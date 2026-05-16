@@ -1,7 +1,6 @@
 import {
   Check,
   CircleAlert,
-  Laptop,
   Loader2,
   MapPin,
   Pencil,
@@ -14,7 +13,7 @@ import {
 } from 'lucide-react';
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import type { BoardIdea, IdeaCardData, Participant } from './types';
-import { getBrowserId, getOrCreateParticipant, getStoredDisplayName } from './lib/identity';
+import { getOrCreateParticipant, getStoredDisplayName } from './lib/identity';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
 
 const titleLimit = 80;
@@ -66,13 +65,6 @@ function App() {
   const [actionIdeaId, setActionIdeaId] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-
-  const browserIdPreview = useMemo(() => {
-    if (typeof window === 'undefined') {
-      return '';
-    }
-    return getBrowserId().slice(0, 8);
-  }, []);
 
   const fetchIdeas = useCallback(async (currentParticipant?: Participant | null) => {
     if (!isSupabaseConfigured) {
@@ -344,8 +336,8 @@ function App() {
             </button>
           </div>
           <p className="identity-note">
-            <Laptop size={14} aria-hidden="true" />
-            浏览器 {browserIdPreview || '--------'} + 用户名识别身份
+            <UsersRound size={14} aria-hidden="true" />
+            同一用户名会被识别为同一个人，跨浏览器也一致
           </p>
         </form>
       </section>

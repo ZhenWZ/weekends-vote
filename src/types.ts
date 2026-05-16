@@ -1,6 +1,6 @@
 export type Participant = {
   id: string;
-  browser_id: string;
+  browser_id: string | null;
   display_name: string;
   created_at: string;
   updated_at: string;

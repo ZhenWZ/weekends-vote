@@ -1,27 +1,8 @@
 import type { Participant } from '../types';
 import { supabase } from './supabase';
 
-const BROWSER_ID_KEY = 'weekend-vote-browser-id';
 const DISPLAY_NAME_KEY = 'weekend-vote-display-name';
-
-const createBrowserId = () => {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return crypto.randomUUID();
-  }
-
-  return `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-};
-
-export const getBrowserId = () => {
-  const existing = localStorage.getItem(BROWSER_ID_KEY);
-  if (existing) {
-    return existing;
-  }
-
-  const next = createBrowserId();
-  localStorage.setItem(BROWSER_ID_KEY, next);
-  return next;
-};
+const LEGACY_BROWSER_ID = 'username-primary';
 
 export const getStoredDisplayName = () => localStorage.getItem(DISPLAY_NAME_KEY) ?? '';
 
@@ -36,24 +17,53 @@ export const getOrCreateParticipant = async (displayName: string): Promise<Parti
     throw new Error('请输入用户名');
   }
 
-  const browserId = getBrowserId();
   const { data, error } = await supabase
     .from('participants')
-    .upsert(
-      {
-        browser_id: browserId,
-        display_name: normalizedName,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'browser_id,display_name' },
-    )
     .select('*')
-    .single();
+    .eq('display_name', normalizedName)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
 
   if (error) {
     throw error;
   }
 
+  if (data) {
+    storeDisplayName(normalizedName);
+    return data;
+  }
+
+  const { data: created, error: insertError } = await supabase
+    .from('participants')
+    .insert({
+      browser_id: LEGACY_BROWSER_ID,
+      display_name: normalizedName,
+    })
+    .select('*')
+    .single();
+
+  if (insertError?.code === '23505') {
+    const { data: retryData, error: retryError } = await supabase
+      .from('participants')
+      .select('*')
+      .eq('display_name', normalizedName)
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .single();
+
+    if (retryError) {
+      throw retryError;
+    }
+
+    storeDisplayName(normalizedName);
+    return retryData;
+  }
+
+  if (insertError) {
+    throw insertError;
+  }
+
   storeDisplayName(normalizedName);
-  return data;
+  return created;
 };
