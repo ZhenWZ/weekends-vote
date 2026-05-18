@@ -5,15 +5,17 @@
 ## 功能
 
 - 输入用户名后提交周末去哪的 idea。
+- 提交页和看板页通过顶部导航切换。
+- 每个 idea 可在创建时上传最多 3 张图片，单张不超过 3MB，支持 JPG、PNG、WebP。
 - 用用户名识别用户；同一个用户名在不同浏览器中也会被视为同一个人。
 - 只能编辑自己用户名下提交的 idea。
 - 每个用户对每个 idea 最多投一票，可取消投票。
-- 看板展示 idea、票数和投票人名单。
+- 看板支持卡片和列表两种视图；卡片显示图片轮播，列表使用紧凑布局。
 
 ## Supabase 设置
 
 1. 新建 Supabase 项目。
-2. 打开 SQL Editor，执行 [`supabase/schema.sql`](supabase/schema.sql)。
+2. 打开 SQL Editor，执行 [`supabase/schema.sql`](supabase/schema.sql)。脚本会创建数据表、RLS 策略和公开的 `idea-images` Storage bucket。
 3. 在 Project Settings > API 里复制 Project URL 和 anon public key。
 4. 本地创建 `.env.local`：
 

@@ -29,6 +29,16 @@ create table if not exists public.votes (
   constraint votes_one_per_participant unique (idea_id, participant_id)
 );
 
+create table if not exists public.idea_images (
+  id uuid primary key default gen_random_uuid(),
+  idea_id uuid not null references public.ideas(id) on delete cascade,
+  storage_path text not null,
+  sort_order integer not null default 0,
+  created_at timestamptz not null default now(),
+  constraint idea_images_storage_path_unique unique (storage_path),
+  constraint idea_images_sort_order_non_negative check (sort_order >= 0)
+);
+
 -- Migration for older installs that used browser_id + display_name as identity.
 -- Identity is now username-first: one display_name maps to one participant.
 update public.participants
@@ -138,6 +148,21 @@ $$;
 create index if not exists ideas_created_at_idx on public.ideas(created_at desc);
 create index if not exists votes_idea_id_idx on public.votes(idea_id);
 create index if not exists votes_participant_id_idx on public.votes(participant_id);
+create index if not exists idea_images_idea_id_sort_order_idx on public.idea_images(idea_id, sort_order);
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'idea-images',
+  'idea-images',
+  true,
+  3145728,
+  array['image/jpeg', 'image/png', 'image/webp']
+)
+on conflict (id) do update
+set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -162,6 +187,7 @@ for each row execute function public.set_updated_at();
 alter table public.participants enable row level security;
 alter table public.ideas enable row level security;
 alter table public.votes enable row level security;
+alter table public.idea_images enable row level security;
 
 drop policy if exists "Anyone can read participants" on public.participants;
 create policy "Anyone can read participants"
@@ -209,3 +235,33 @@ drop policy if exists "Anyone can delete votes" on public.votes;
 create policy "Anyone can delete votes"
 on public.votes for delete
 using (true);
+
+drop policy if exists "Anyone can read idea images" on public.idea_images;
+create policy "Anyone can read idea images"
+on public.idea_images for select
+using (true);
+
+drop policy if exists "Anyone can create idea images" on public.idea_images;
+create policy "Anyone can create idea images"
+on public.idea_images for insert
+with check (true);
+
+drop policy if exists "Anyone can delete idea images" on public.idea_images;
+create policy "Anyone can delete idea images"
+on public.idea_images for delete
+using (true);
+
+drop policy if exists "Anyone can read idea image files" on storage.objects;
+create policy "Anyone can read idea image files"
+on storage.objects for select
+using (bucket_id = 'idea-images');
+
+drop policy if exists "Anyone can upload idea image files" on storage.objects;
+create policy "Anyone can upload idea image files"
+on storage.objects for insert
+with check (bucket_id = 'idea-images');
+
+drop policy if exists "Anyone can delete idea image files" on storage.objects;
+create policy "Anyone can delete idea image files"
+on storage.objects for delete
+using (bucket_id = 'idea-images');

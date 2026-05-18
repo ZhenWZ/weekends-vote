@@ -22,13 +22,29 @@ export type Vote = {
   created_at: string;
 };
 
+export type IdeaImage = {
+  id: string;
+  idea_id: string;
+  storage_path: string;
+  sort_order: number;
+  created_at: string;
+};
+
 export type IdeaCardData = Idea & {
   author: Pick<Participant, 'id' | 'display_name'> | null;
+  images: IdeaImage[];
   votes: Array<
     Vote & {
       voter: Pick<Participant, 'id' | 'display_name'> | null;
     }
   >;
+};
+
+export type BoardIdeaImage = {
+  id: string;
+  storagePath: string;
+  url: string;
+  sortOrder: number;
 };
 
 export type BoardIdea = {
@@ -41,6 +57,7 @@ export type BoardIdea = {
   updatedAt: string;
   voteCount: number;
   voters: Array<{ id: string; name: string }>;
+  images: BoardIdeaImage[];
   hasMyVote: boolean;
   isMine: boolean;
 };
