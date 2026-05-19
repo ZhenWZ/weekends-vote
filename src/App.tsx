@@ -39,6 +39,14 @@ type ActivePage = 'submit' | 'board';
 type BoardView = 'card' | 'list';
 type IdeaDraft = { title: string; description: string };
 type SelectedImage = { id: string; file: File; previewUrl: string };
+type EditableImage = {
+  id: string;
+  originalImageId: string | null;
+  originalStoragePath: string | null;
+  originalUrl: string | null;
+  replacement: SelectedImage | null;
+  isDeleted: boolean;
+};
 
 const emptyDraft: IdeaDraft = { title: '', description: '' };
 
@@ -60,6 +68,65 @@ const getImageExtension = (file: File) => imageExtensionsByType[file.type] ?? 'j
 
 const getIdeaImagePublicUrl = (storagePath: string) =>
   supabase.storage.from(ideaImageBucket).getPublicUrl(storagePath).data.publicUrl;
+
+class ImageEditError extends Error {
+  refreshBoard: boolean;
+  closeEditor: boolean;
+
+  constructor(message: string, options?: { refreshBoard?: boolean; closeEditor?: boolean }) {
+    super(message);
+    this.name = 'ImageEditError';
+    this.refreshBoard = options?.refreshBoard ?? false;
+    this.closeEditor = options?.closeEditor ?? false;
+  }
+}
+
+const createSelectedImage = (file: File): SelectedImage => ({
+  id: createClientId(),
+  file,
+  previewUrl: URL.createObjectURL(file),
+});
+
+const pickValidImages = (files: File[], availableSlots: number) => {
+  const validationMessages: string[] = [];
+
+  if (availableSlots <= 0) {
+    return {
+      images: [],
+      validationMessages: [`每个 idea 最多上传 ${maxIdeaImages} 张图片`],
+    };
+  }
+
+  if (files.length > availableSlots) {
+    validationMessages.push(`每个 idea 最多 ${maxIdeaImages} 张图片，已忽略多余图片`);
+  }
+
+  const images = files.slice(0, availableSlots).flatMap((file) => {
+    if (!allowedImageTypes.has(file.type)) {
+      validationMessages.push(`${file.name} 不是支持的图片格式`);
+      return [];
+    }
+
+    if (file.size > maxImageBytes) {
+      validationMessages.push(`${file.name} 超过 3MB`);
+      return [];
+    }
+
+    return [createSelectedImage(file)];
+  });
+
+  return { images, validationMessages };
+};
+
+const revokeEditableImagePreviews = (images: EditableImage[]) => {
+  images.forEach((image) => {
+    if (image.replacement) {
+      URL.revokeObjectURL(image.replacement.previewUrl);
+    }
+  });
+};
+
+const getEditableImagePreviewUrl = (image: EditableImage) => image.replacement?.previewUrl ?? image.originalUrl ?? '';
 
 const normalizeIdea = (idea: IdeaCardData, currentParticipantId?: string): BoardIdea => {
   const voters = idea.votes
@@ -121,6 +188,79 @@ const uploadIdeaImage = async (ideaId: string, selectedImage: SelectedImage, sor
   if (imageRecordError) {
     await supabase.storage.from(ideaImageBucket).remove([storagePath]);
     throw imageRecordError;
+  }
+
+  return storagePath;
+};
+
+const removeIdeaImageRecordAndFile = async (ideaId: string, image: EditableImage) => {
+  if (!image.originalImageId || !image.originalStoragePath) {
+    return;
+  }
+
+  const { error: recordDeleteError } = await supabase
+    .from('idea_images')
+    .delete()
+    .eq('id', image.originalImageId)
+    .eq('idea_id', ideaId);
+
+  if (recordDeleteError) {
+    throw recordDeleteError;
+  }
+
+  const { error: storageDeleteError } = await supabase.storage
+    .from(ideaImageBucket)
+    .remove([image.originalStoragePath]);
+
+  if (storageDeleteError) {
+    throw new ImageEditError(`图片记录已删除，但 Storage 文件删除失败：${storageDeleteError.message}`, {
+      refreshBoard: true,
+      closeEditor: true,
+    });
+  }
+};
+
+const rollbackUploadedIdeaImage = async (storagePath: string) => {
+  const { error: recordDeleteError } = await supabase.from('idea_images').delete().eq('storage_path', storagePath);
+  const { error: storageDeleteError } = await supabase.storage.from(ideaImageBucket).remove([storagePath]);
+
+  if (recordDeleteError || storageDeleteError) {
+    throw new ImageEditError(
+      `替换图片失败，且新图片清理失败：${recordDeleteError?.message ?? storageDeleteError?.message ?? '未知错误'}`,
+      {
+        refreshBoard: true,
+        closeEditor: true,
+      },
+    );
+  }
+};
+
+const replaceIdeaImage = async (ideaId: string, image: EditableImage, sortOrder: number) => {
+  if (!image.originalImageId || !image.originalStoragePath || !image.replacement) {
+    return;
+  }
+
+  const newStoragePath = await uploadIdeaImage(ideaId, image.replacement, sortOrder);
+  const { error: recordDeleteError } = await supabase
+    .from('idea_images')
+    .delete()
+    .eq('id', image.originalImageId)
+    .eq('idea_id', ideaId);
+
+  if (recordDeleteError) {
+    await rollbackUploadedIdeaImage(newStoragePath);
+    throw recordDeleteError;
+  }
+
+  const { error: storageDeleteError } = await supabase.storage
+    .from(ideaImageBucket)
+    .remove([image.originalStoragePath]);
+
+  if (storageDeleteError) {
+    throw new ImageEditError(`图片已替换，但旧 Storage 文件删除失败：${storageDeleteError.message}`, {
+      refreshBoard: true,
+      closeEditor: true,
+    });
   }
 };
 
@@ -186,6 +326,7 @@ function App() {
   const [selectedImages, setSelectedImages] = useState<SelectedImage[]>([]);
   const [editIdeaId, setEditIdeaId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<IdeaDraft>(emptyDraft);
+  const [editImages, setEditImages] = useState<EditableImage[]>([]);
   const [loadingBoard, setLoadingBoard] = useState(false);
   const [savingName, setSavingName] = useState(false);
   const [savingIdea, setSavingIdea] = useState(false);
@@ -193,14 +334,20 @@ function App() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const selectedImagesRef = useRef<SelectedImage[]>([]);
+  const editImagesRef = useRef<EditableImage[]>([]);
 
   useEffect(() => {
     selectedImagesRef.current = selectedImages;
   }, [selectedImages]);
 
+  useEffect(() => {
+    editImagesRef.current = editImages;
+  }, [editImages]);
+
   useEffect(
     () => () => {
       selectedImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl));
+      revokeEditableImagePreviews(editImagesRef.current);
     },
     [],
   );
@@ -319,6 +466,13 @@ function App() {
     });
   }, []);
 
+  const clearEditImages = useCallback(() => {
+    setEditImages((currentImages) => {
+      revokeEditableImagePreviews(currentImages);
+      return [];
+    });
+  }, []);
+
   const requireParticipant = () => {
     if (!participant) {
       setError('请先设置用户名');
@@ -343,37 +497,7 @@ function App() {
     }
 
     const availableSlots = maxIdeaImages - selectedImages.length;
-    const validationMessages: string[] = [];
-
-    if (availableSlots <= 0) {
-      setMessage('');
-      setError(`每个 idea 最多上传 ${maxIdeaImages} 张图片`);
-      return;
-    }
-
-    if (pickedFiles.length > availableSlots) {
-      validationMessages.push(`每个 idea 最多 ${maxIdeaImages} 张图片，已忽略多余图片`);
-    }
-
-    const nextImages = pickedFiles.slice(0, availableSlots).flatMap((file) => {
-      if (!allowedImageTypes.has(file.type)) {
-        validationMessages.push(`${file.name} 不是支持的图片格式`);
-        return [];
-      }
-
-      if (file.size > maxImageBytes) {
-        validationMessages.push(`${file.name} 超过 3MB`);
-        return [];
-      }
-
-      return [
-        {
-          id: createClientId(),
-          file,
-          previewUrl: URL.createObjectURL(file),
-        },
-      ];
-    });
+    const { images: nextImages, validationMessages } = pickValidImages(pickedFiles, availableSlots);
 
     if (nextImages.length) {
       setSelectedImages((currentImages) => [...currentImages, ...nextImages]);
@@ -464,6 +588,17 @@ function App() {
       title: idea.title,
       description: idea.description,
     });
+    setEditImages((currentImages) => {
+      revokeEditableImagePreviews(currentImages);
+      return idea.images.map((image) => ({
+        id: image.id,
+        originalImageId: image.id,
+        originalStoragePath: image.storagePath,
+        originalUrl: image.url,
+        replacement: null,
+        isDeleted: false,
+      }));
+    });
     setError('');
     setMessage('');
   };
@@ -471,6 +606,125 @@ function App() {
   const cancelEditing = () => {
     setEditIdeaId(null);
     setEditDraft(emptyDraft);
+    clearEditImages();
+  };
+
+  const handleEditImageAddition = (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const pickedFiles = Array.from(input.files ?? []);
+    input.value = '';
+
+    if (!pickedFiles.length) {
+      return;
+    }
+
+    const activeImageCount = editImages.filter((image) => !image.isDeleted).length;
+    const { images: nextImages, validationMessages } = pickValidImages(
+      pickedFiles,
+      maxIdeaImages - activeImageCount,
+    );
+
+    if (nextImages.length) {
+      setEditImages((currentImages) => [
+        ...currentImages,
+        ...nextImages.map((image) => ({
+          id: image.id,
+          originalImageId: null,
+          originalStoragePath: null,
+          originalUrl: null,
+          replacement: image,
+          isDeleted: false,
+        })),
+      ]);
+    }
+
+    setMessage('');
+    setError(validationMessages.join('；'));
+  };
+
+  const handleEditImageReplacement = (event: ChangeEvent<HTMLInputElement>, imageId: string) => {
+    const input = event.currentTarget;
+    const pickedFiles = Array.from(input.files ?? []);
+    input.value = '';
+
+    if (!pickedFiles.length) {
+      return;
+    }
+
+    const { images: replacementImages, validationMessages } = pickValidImages(pickedFiles, 1);
+    const replacement = replacementImages[0];
+
+    if (replacement) {
+      setEditImages((currentImages) =>
+        currentImages.map((image) => {
+          if (image.id !== imageId) {
+            return image;
+          }
+
+          if (image.replacement) {
+            URL.revokeObjectURL(image.replacement.previewUrl);
+          }
+
+          return {
+            ...image,
+            replacement,
+            isDeleted: false,
+          };
+        }),
+      );
+    }
+
+    setMessage('');
+    setError(validationMessages.join('；'));
+  };
+
+  const removeEditImage = (imageId: string) => {
+    setEditImages((currentImages) =>
+      currentImages.flatMap((image) => {
+        if (image.id !== imageId) {
+          return [image];
+        }
+
+        if (image.replacement) {
+          URL.revokeObjectURL(image.replacement.previewUrl);
+        }
+
+        if (!image.originalImageId) {
+          return [];
+        }
+
+        return [
+          {
+            ...image,
+            replacement: null,
+            isDeleted: true,
+          },
+        ];
+      }),
+    );
+  };
+
+  const syncEditedImages = async (ideaId: string) => {
+    const deletedImages = editImages.filter((image) => image.isDeleted && image.originalImageId);
+    const activeImages = editImages.filter((image) => !image.isDeleted);
+
+    for (const image of deletedImages) {
+      await removeIdeaImageRecordAndFile(ideaId, image);
+    }
+
+    for (let index = 0; index < activeImages.length; index += 1) {
+      const image = activeImages[index];
+      if (image.originalImageId && image.replacement) {
+        await replaceIdeaImage(ideaId, image, index);
+      }
+    }
+
+    for (let index = 0; index < activeImages.length; index += 1) {
+      const image = activeImages[index];
+      if (!image.originalImageId && image.replacement) {
+        await uploadIdeaImage(ideaId, image.replacement, index);
+      }
+    }
   };
 
   const submitEdit = async (event: FormEvent, idea: BoardIdea) => {
@@ -492,29 +746,45 @@ function App() {
     setError('');
     setMessage('');
 
-    const { data, error: updateError } = await supabase
-      .from('ideas')
-      .update({
-        title,
-        description: description || null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', idea.id)
-      .eq('author_id', currentParticipant.id)
-      .select('id')
-      .maybeSingle();
+    try {
+      const { data, error: updateError } = await supabase
+        .from('ideas')
+        .update({
+          title,
+          description: description || null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', idea.id)
+        .eq('author_id', currentParticipant.id)
+        .select('id')
+        .maybeSingle();
 
-    if (updateError) {
-      setError(updateError.message);
-    } else if (!data) {
-      setError('只有提交者可以修改这个 idea');
-    } else {
+      if (updateError) {
+        setError(updateError.message);
+        return;
+      }
+
+      if (!data) {
+        setError('只有提交者可以修改这个 idea');
+        return;
+      }
+
+      await syncEditedImages(idea.id);
       cancelEditing();
       setMessage('idea 已更新');
       await fetchIdeas(currentParticipant);
-    }
+    } catch (caughtError) {
+      if (caughtError instanceof ImageEditError && caughtError.refreshBoard) {
+        if (caughtError.closeEditor) {
+          cancelEditing();
+        }
+        await fetchIdeas(currentParticipant);
+      }
 
-    setActionIdeaId(null);
+      setError(getErrorMessage(caughtError, '更新图片失败'));
+    } finally {
+      setActionIdeaId(null);
+    }
   };
 
   const toggleVote = async (idea: BoardIdea) => {
@@ -544,6 +814,8 @@ function App() {
   };
 
   const imageUploadDisabled = !participant || savingIdea || selectedImages.length >= maxIdeaImages;
+  const activeEditImages = editImages.filter((image) => !image.isDeleted);
+  const editImageUploadDisabled = !participant || Boolean(actionIdeaId) || activeEditImages.length >= maxIdeaImages;
 
   return (
     <main className="app-shell">
@@ -786,6 +1058,79 @@ function App() {
                           onChange={(event) => setEditDraft((draft) => ({ ...draft, description: event.target.value }))}
                           disabled={isBusy}
                         />
+                        <div className="edit-image-manager">
+                          <div className="image-upload-heading">
+                            <div>
+                              <span className="field-label">图片</span>
+                              <p>最多 {maxIdeaImages} 张，支持 JPG、PNG、WebP，单张不超过 3MB。</p>
+                            </div>
+                            <span className="image-count">
+                              {activeEditImages.length}/{maxIdeaImages}
+                            </span>
+                          </div>
+
+                          {activeEditImages.length ? (
+                            <div className="edit-image-grid" aria-label="正在编辑的图片">
+                              {activeEditImages.map((image, index) => (
+                                <div className="edit-image-preview" key={image.id}>
+                                  <img src={getEditableImagePreviewUrl(image)} alt={`${idea.title} 编辑图片 ${index + 1}`} />
+                                  {image.replacement ? (
+                                    <span className="image-change-badge">
+                                      {image.originalImageId ? '待替换' : '待添加'}
+                                    </span>
+                                  ) : null}
+                                  <div className="edit-image-actions">
+                                    <label
+                                      className={isBusy ? 'edit-image-action edit-image-action-disabled' : 'edit-image-action'}
+                                      aria-label={`替换第 ${index + 1} 张图片`}
+                                    >
+                                      <Pencil size={15} aria-hidden="true" />
+                                      <span>替换</span>
+                                      <input
+                                        type="file"
+                                        accept="image/jpeg,image/png,image/webp"
+                                        onChange={(event) => handleEditImageReplacement(event, image.id)}
+                                        disabled={isBusy}
+                                      />
+                                    </label>
+                                    <button
+                                      className="edit-image-action edit-image-action-danger"
+                                      type="button"
+                                      onClick={() => removeEditImage(image.id)}
+                                      disabled={isBusy}
+                                      aria-label={`删除第 ${index + 1} 张图片`}
+                                    >
+                                      <Trash2 size={15} aria-hidden="true" />
+                                      <span>删除</span>
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="edit-image-empty">尚未添加图片</div>
+                          )}
+
+                          <label
+                            className={
+                              editImageUploadDisabled
+                                ? 'file-dropzone file-dropzone-compact file-dropzone-disabled'
+                                : 'file-dropzone file-dropzone-compact'
+                            }
+                            htmlFor={`edit-images-${idea.id}`}
+                          >
+                            <ImagePlus size={18} aria-hidden="true" />
+                            <span>添加图片</span>
+                            <input
+                              id={`edit-images-${idea.id}`}
+                              type="file"
+                              accept="image/jpeg,image/png,image/webp"
+                              multiple
+                              onChange={handleEditImageAddition}
+                              disabled={editImageUploadDisabled || isBusy}
+                            />
+                          </label>
+                        </div>
                         <div className="card-actions">
                           <button className="button button-primary" type="submit" disabled={isBusy}>
                             {isBusy ? <Loader2 className="spin" size={18} /> : <Check size={18} />}
